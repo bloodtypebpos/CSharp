@@ -14,7 +14,7 @@ class Program
         Directory.SetCurrentDirectory(@"C:\Users\Matt Tigrett\Desktop\csharp");
 
         // SQL local database
-        var masterConnectionString = @"Server=(localdb)\MSSQLLocalDB;Integreated Sucurity=true;Initial Catalog=master";
+        var masterConnectionString = @"Server=(localdb)\MSSQLLocalDB;Integrated Security=true;Initial Catalog=master";
         using (var cnx = new SqlConnection(masterConnectionString))
         {
             cnx.Open();
