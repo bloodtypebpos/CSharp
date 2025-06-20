@@ -23,7 +23,7 @@ class Program
         ImportExcelToSqlTable("Inventory.xlsx", "Inventory", connection);
         ImportExcelToSqlTable("PurchaseOrderReport.xlsx", "PurchaseOrderReport", connection);
         ImportExcelToSqlTable("OpenSalesOrders.xlsx", "OpenSalesOrders", connection);
-        ImportExcelToSqlTable("BOM.xlsx", "BOM", connection);
+        //ImportExcelToSqlTable("BOM.xlsx", "BOM", connection); // Should only have to do this once a month or so
         ImportExcelToSqlTable("PartLocations.xlsx", "PartLocations", connection);
 
 
@@ -31,16 +31,101 @@ class Program
         Console.WriteLine("====   GETTING PROCUREMENT DETAILS FROM ORDERS  ====");
 
         // Get information on what needs to be built
-        var query = "SELECT * FROM OpenSalesOrders";
-        var openOrders = LoadItemsFromQuery(query, connection);
-        foreach (var item in openOrders)
+        var partsDict = new Dictionary<string, decimal>();
+
+        var openOrders = LoadItemsFromQuery(
+            "SELECT [SO No], [Item ID], [Qty Remaining] FROM [OpenSalesOrders]", connection);
+
+        foreach (var orderItem in openOrders)
         {
-            foreach(var kvp in item.GetAllAttributes())
+            string itemId = orderItem.GetAttr("Item ID")?.ToString();
+            decimal qtyRemaining = orderItem.GetAttr("Qty Remaining") is decimal d ? d : 0;
+
+            if (string.IsNullOrWhiteSpace(itemId) || qtyRemaining <= 0)
+                continue;
+
+            // Check BOM for subparts of this item (i.e., see if it's an assembly)
+            string bomQuery = $"SELECT [Item ID], [Qty Needed] FROM [BOM] WHERE [Assembly] = @assembly";
+            using var cmd = new SqlCommand(bomQuery, connection);
+            cmd.Parameters.AddWithValue("@assembly", itemId);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.HasRows)
             {
-                Console.WriteLine($"{kvp.Key}: {kvp.Value}");
+                // It's a standalone part
+                if (!partsDict.ContainsKey(itemId))
+                    partsDict[itemId] = 0;
+
+                partsDict[itemId] += qtyRemaining;
             }
-            Console.WriteLine("-------------------------------------");
+            else
+            {
+                // It's an assembly — explode into parts
+                while (reader.Read())
+                {
+                    string subItemId = reader["Item ID"].ToString();
+                    decimal qtyNeeded = reader["Qty Needed"] is decimal qn ? qn : 0;
+                    if (string.IsNullOrWhiteSpace(subItemId) || qtyNeeded <= 0)
+                        continue;
+                    decimal totalQty = qtyNeeded * qtyRemaining;
+                    if (!partsDict.ContainsKey(subItemId))
+                        partsDict[subItemId] = 0;
+                    partsDict[subItemId] += totalQty;
+                }
+            }
+            reader.Close(); // make sure reader is closed before the next iteration
         }
+
+        // Convert dictionary into List<Item>
+        var parts = new List<Item>();
+
+        foreach (var kvp in partsDict)
+        {
+            string itemId = kvp.Key;
+            decimal qtyNeeded = kvp.Value;
+            var item = new Item();
+            item.SetAttr("Item ID", itemId);
+            item.SetAttr("Qty Needed", qtyNeeded);
+            string sql = @"
+            SELECT 
+                i.[Item Description],
+                i.[Qty on Hand],
+                pl.[Location],
+                pl.[Code],
+                pl.[Preferred Vendor],
+                po.[PO No],
+                po.[Vendor Name],
+                po.[Qty Remaining]
+            FROM Inventory i
+            LEFT JOIN PartLocations pl ON i.[Item ID] = pl.[Item ID]
+            LEFT JOIN PurchaseOrderReport po ON i.[Item ID] = po.[Item ID]
+            WHERE i.[Item ID] = @id";
+            using var cmd = new SqlCommand(sql, connection);
+            cmd.Parameters.AddWithValue("@id", itemId);
+            using var reader = cmd.ExecuteReader();
+            if (reader.Read())
+            {
+                // Inventory
+                item.SetAttr("Item Description", reader["Item Description"]?.ToString());
+                decimal qtyOnHand = reader["Qty on Hand"] is decimal q ? q : 0;
+                item.SetAttr("Qty on Hand", qtyOnHand);
+                item.SetAttr("Qty Difference", qtyOnHand - qtyNeeded);
+
+                // PartLocations
+                item.SetAttr("Location", reader["Location"]?.ToString());
+                item.SetAttr("Code", reader["Code"]?.ToString());
+                item.SetAttr("Preferred Vendor", reader["Preferred Vendor"]?.ToString());
+
+                // PO Report
+                item.SetAttr("PO No", reader["PO No"]?.ToString());
+                item.SetAttr("Vendor Name", reader["Vendor Name"]?.ToString());
+                decimal poQty = reader["Qty Remaining"] is decimal p ? p : 0;
+                item.SetAttr("PO Qty Remaining", poQty);
+
+                parts.Add(item);  // ✅ only add if Inventory match was found
+            }
+        }
+
+        ExportPartsToExcel(parts);
     }
 
     class Item
@@ -228,5 +313,47 @@ class Program
             items.Add(item);
         }
         return items;
+    }
+
+    static void ExportPartsToExcel(List<Item> parts)
+    {
+        string templatePath = "BOMoutTemplate.xlsx";
+        string outputPath = "BOMout.xlsx";
+        // Header mapping
+        var headerMap = new Dictionary<string, string>
+    {
+        { "Item ID", "PART" },
+        { "Item Description", "DESCRIPTION" },
+        { "Qty on Hand", "HAVE" },
+        { "Qty Needed", "NEED" },
+        { "Qty Difference", "DIFF" },
+        { "Location", "LOCATION" },
+        { "PO No", "PO No" },
+        { "Preferred Vendor", "VENDOR" },
+        { "PO Qty Remaining", "QTY" },
+        { "Code", "CODE" }
+    };
+        using var workbook = new XLWorkbook(templatePath);
+        var sheet = workbook.Worksheet(1);
+        // Write header row
+        int row = 1;
+        int col = 1;
+        foreach (var label in headerMap.Values)
+        {
+            sheet.Cell(row, col++).Value = label;
+        }
+        // Write part data
+        foreach (var item in parts)
+        {
+            row++;
+            col = 1;
+            foreach (var field in headerMap.Keys)
+            {
+                var value = item.GetAttr(field);
+                sheet.Cell(row, col++).Value = value?.ToString() ?? "";
+            }
+        }
+        workbook.SaveAs(outputPath);
+        Console.WriteLine($"Exported {parts.Count} parts to '{outputPath}'.");
     }
 }
